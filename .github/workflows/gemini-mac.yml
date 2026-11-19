@@ -1,0 +1,186 @@
+name: Gemini Mac run
+run-name: Gemini Mac run #${{ github.event.issue.number }}
+
+on:
+  issues:
+    types: [opened]
+
+permissions:
+  contents: read
+  issues: write
+
+concurrency:
+  group: gemini-mac-${{ github.event.issue.number }}
+  cancel-in-progress: false
+
+jobs:
+  authorize:
+    if: >-
+      github.actor == github.repository_owner &&
+      github.event.issue.user.login == github.repository_owner &&
+      startsWith(github.event.issue.title, '[gemini-run]')
+    runs-on: ubuntu-latest
+    steps:
+      - name: Verify trusted actor
+        env:
+          ACTOR: ${{ github.actor }}
+          TRIGGER: ${{ github.triggering_actor }}
+          ISSUE_USER: ${{ github.event.issue.user.login }}
+          OWNER: ${{ github.repository_owner }}
+        run: |
+          test "$ACTOR" = "$OWNER"
+          test "$TRIGGER" = "$OWNER"
+          test "$ISSUE_USER" = "$OWNER"
+
+  run:
+    needs: authorize
+    runs-on: [self-hosted, macOS, ARM64, mac-bridge]
+    timeout-minutes: 130
+    defaults:
+      run:
+        shell: bash --noprofile --norc -e "{0}"
+    steps:
+      - name: Execute command on Mac and reply to issue
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          REPO: ${{ github.repository }}
+          ISSUE_NUMBER: ${{ github.event.issue.number }}
+          ISSUE_BODY: ${{ github.event.issue.body }}
+          RUN_ID: ${{ github.run_id }}
+          RUNNER_NAME: ${{ runner.name }}
+        run: |
+          python3 - <<'PYEOF'
+          import datetime, json, os, re, subprocess, time
+
+          api = os.environ["GITHUB_API_URL"]
+          repo = os.environ["REPO"]
+          issue_number = os.environ["ISSUE_NUMBER"]
+          token = os.environ["GH_TOKEN"]
+          body = (os.environ.get("ISSUE_BODY") or "").strip()
+          run_id = os.environ.get("RUN_ID", "")
+          runner_name = os.environ.get("RUNNER_NAME", "")
+
+          workdir, timeout_minutes, command = "~", 30, ""
+          json_match = re.search(r"```json\s*(\{.*?\})\s*```", body, re.S)
+          parsed = None
+          if json_match:
+              try:
+                  parsed = json.loads(json_match.group(1))
+              except Exception:
+                  parsed = None
+          elif body.startswith("{"):
+              try:
+                  parsed = json.loads(body)
+              except Exception:
+                  parsed = None
+
+          if isinstance(parsed, dict) and "command" in parsed:
+              command = str(parsed.get("command") or "")
+              workdir = str(parsed.get("workdir") or "~")
+              try:
+                  timeout_minutes = int(parsed.get("timeout_minutes") or 30)
+              except Exception:
+                  timeout_minutes = 30
+          else:
+              wd_match = re.search(r"(?im)^workdir:\s*(.+)$", body)
+              if wd_match:
+                  workdir = wd_match.group(1).strip()
+              tm_match = re.search(r"(?im)^timeout_minutes:\s*(\d+)$", body)
+              if tm_match:
+                  timeout_minutes = int(tm_match.group(1))
+              fence_match = re.search(r"```(?:zsh|bash|sh)?\s*
+(.*?)```", body, re.S)
+              command = fence_match.group(1).strip() if fence_match else body
+
+          timeout_minutes = max(1, min(120, timeout_minutes))
+          expanded_dir = os.path.expanduser(workdir or "~")
+
+          env = os.environ.copy()
+          extra_path = "/opt/homebrew/bin:/usr/local/bin:/Applications/Docker.app/Contents/Resources/bin"
+          env["PATH"] = f"{extra_path}:{env.get('PATH', '')}"
+          env["LANG"] = "en_US.UTF-8"
+          env["LC_ALL"] = "en_US.UTF-8"
+          env["PYTHONIOENCODING"] = "utf-8"
+          env.pop("GH_TOKEN", None)
+
+          started, timed_out = time.monotonic(), False
+          if not command:
+              code, output = 2, "[gemini-mac] Empty command in issue body."
+          elif not os.path.isdir(expanded_dir):
+              code, output = 2, f"[gemini-mac] Working directory not found: {expanded_dir}"
+          else:
+              try:
+                  proc = subprocess.run(
+                      ["/bin/zsh", "-l", "-c", command],
+                      cwd=expanded_dir,
+                      env=env,
+                      stdout=subprocess.PIPE,
+                      stderr=subprocess.STDOUT,
+                      text=True,
+                      errors="replace",
+                      timeout=timeout_minutes * 60,
+                  )
+                  code, output = proc.returncode, proc.stdout or ""
+              except subprocess.TimeoutExpired as exc:
+                  timed_out, code = True, 124
+                  partial = exc.stdout or ""
+                  if isinstance(partial, bytes):
+                      partial = partial.decode("utf-8", errors="replace")
+                  output = f"{partial}
+[gemini-mac] Timed out after {timeout_minutes} minutes."
+
+          duration = round(time.monotonic() - started, 2)
+          finished_at = datetime.datetime.now(datetime.timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
+
+          truncated = False
+          if len(output) > 56000:
+              truncated = True
+              output = output[:12000] + "
+
+... [truncated middle] ...
+
+" + output[-42000:]
+
+          fence = "````" if "```" in output else "```"
+          timeout_tag = " (timed out)" if timed_out else ""
+          note_line = "- **Note**: Output truncated to fit GitHub comment limit.
+" if truncated else ""
+          comment = (
+              "### Gemini Mac Run Result
+"
+              f"- **Status**: `exit_code={code}`{timeout_tag}
+"
+              f"- **Runner**: `{runner_name}` | **Duration**: `{duration}s` | **Run ID**: `{run_id}`
+"
+              f"- **Workdir**: `{expanded_dir}` | **Finished (UTC)**: `{finished_at}`
+"
+              f"{note_line}
+"
+              f"{fence}text
+{output.rstrip()}
+{fence}
+"
+          )
+
+          def gh_api(method, path, payload):
+              subprocess.run(
+                  [
+                      "curl", "-fsSL", "-X", method,
+                      "-H", f"Authorization: Bearer {token}",
+                      "-H", "Accept: application/vnd.github+json",
+                      "-H", "Content-Type: application/json",
+                      "-H", "X-GitHub-Api-Version: 2022-11-28",
+                      "--data-binary", "@-",
+                      f"{api}{path}",
+                  ],
+                  input=json.dumps(payload),
+                  text=True,
+                  check=True,
+              )
+
+          gh_api("POST", f"/repos/{repo}/issues/{issue_number}/comments", {"body": comment})
+          gh_api("PATCH", f"/repos/{repo}/issues/{issue_number}", {"state": "closed", "state_reason": "completed"})
+
+          if code != 0:
+              raise SystemExit(code)
+          PYEOF
